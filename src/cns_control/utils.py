@@ -75,6 +75,26 @@ def _fit_tilt_plane(reference_points):
     return origin, coefficients, rmse
 
 
+def _ordered_grid_coordinates(xs, ys, snake_axis=None):
+    """Yield grid XY coordinates in raster or axis-selected snake order."""
+    if snake_axis not in (None, "x", "y"):
+        raise ValueError("snake_axis must be None, 'x', or 'y'")
+
+    if snake_axis == "x":
+        for row, gy in enumerate(ys):
+            row_xs = xs if row % 2 == 0 else xs[::-1]
+            for gx in row_xs:
+                yield gx, gy
+        return
+
+    for column, gx in enumerate(xs):
+        column_ys = (
+            ys[::-1] if snake_axis == "y" and column % 2 else ys
+        )
+        for gy in column_ys:
+            yield gx, gy
+
+
 def _remove_grid_placeholder(viewer):
     """Remove the grid placeholder layer if a previous Raman grid created it."""
     try:
@@ -820,7 +840,8 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
                           autofocus_object='None',
                           corner_positions=None,
                           x_count=None, y_count=None,
-                          tilt_reference_points=None):
+                          tilt_reference_points=None,
+                          snake_axis=None):
     """
     Build a grid of stage positions, each carrying `repeats` copies of the
     SAME single fixed point (fov_x, fov_y). By default the grid is centered on
@@ -846,6 +867,11 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
         Focused stage-space references used to fit a least-squares Z plane.
         When provided, the fitted Z replaces the template Z at every grid
         position. At least three non-collinear XY references are required.
+    snake_axis : {'x', 'y'} or None
+        Fast axis for snake traversal. X reverses direction on alternating Y
+        rows; Y reverses direction on alternating X columns. None preserves
+        the original raster order. The resulting position order is shared by
+        every acquisition channel in the MDA sequence.
 
     Writes the freshly-built grid of positions into the napari MDA widget and
     returns the (sources, autofocus_p, new_seq) contract the MDA expects. The
@@ -894,18 +920,17 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
         )
     template = seq.stage_positions[0]
     grid_positions = []
-    for gx in xs:
-        for gy in ys:
-            position_values = {"x": float(gx), "y": float(gy)}
-            if tilt_model is not None:
-                origin, coefficients, _rmse = tilt_model
-                centered_xy = np.array([gx, gy]) - origin
-                position_values["z"] = float(
-                    coefficients[0] * centered_xy[0]
-                    + coefficients[1] * centered_xy[1]
-                    + coefficients[2]
-                )
-            grid_positions.append(template.replace(**position_values))
+    for gx, gy in _ordered_grid_coordinates(xs, ys, snake_axis):
+        position_values = {"x": float(gx), "y": float(gy)}
+        if tilt_model is not None:
+            origin, coefficients, _rmse = tilt_model
+            centered_xy = np.array([gx, gy]) - origin
+            position_values["z"] = float(
+                coefficients[0] * centered_xy[0]
+                + coefficients[1] * centered_xy[1]
+                + coefficients[2]
+            )
+        grid_positions.append(template.replace(**position_values))
     new_seq = seq.replace(stage_positions=grid_positions)
 
     # Write the generated positions into the napari MDA widget so the later

@@ -141,6 +141,7 @@ def run_grid(
     grid_setup, *, preview_channel, use_placeholder=False, x_range=1.0,
     corner_positions=None, x_count=None, y_count=None,
     tilt_reference_points=None,
+    snake_axis=None,
 ):
     core, viewer, main_window, _channels = grid_setup
     return utils.grid_point_selections(
@@ -161,6 +162,7 @@ def run_grid(
         x_count=x_count,
         y_count=y_count,
         tilt_reference_points=tilt_reference_points,
+        snake_axis=snake_axis,
     )
 
 
@@ -237,6 +239,44 @@ def test_grid_rejects_only_one_axis_count(grid_setup):
             preview_channel=None,
             x_count=3,
         )
+
+
+def test_x_fast_snake_reverses_alternating_y_rows(grid_setup):
+    _sources, _autofocus_p, sequence = run_grid(
+        grid_setup,
+        preview_channel=None,
+        corner_positions=((0.0, 0.0), (2.0, 2.0)),
+        x_count=3,
+        y_count=3,
+        snake_axis="x",
+    )
+
+    assert [(position.x, position.y) for position in sequence.stage_positions] == [
+        (0.0, 0.0), (1.0, 0.0), (2.0, 0.0),
+        (2.0, 1.0), (1.0, 1.0), (0.0, 1.0),
+        (0.0, 2.0), (1.0, 2.0), (2.0, 2.0),
+    ]
+
+
+def test_y_fast_snake_reverses_alternating_x_columns_and_keeps_channels(
+    grid_setup,
+):
+    _core, _viewer, _main_window, original_channels = grid_setup
+    _sources, _autofocus_p, sequence = run_grid(
+        grid_setup,
+        preview_channel=None,
+        corner_positions=((0.0, 0.0), (2.0, 2.0)),
+        x_count=3,
+        y_count=3,
+        snake_axis="y",
+    )
+
+    assert [(position.x, position.y) for position in sequence.stage_positions] == [
+        (0.0, 0.0), (0.0, 1.0), (0.0, 2.0),
+        (1.0, 2.0), (1.0, 1.0), (1.0, 0.0),
+        (2.0, 0.0), (2.0, 1.0), (2.0, 2.0),
+    ]
+    assert sequence.channels == original_channels
 
 
 def test_tilt_plane_fit_recovers_slopes_and_offset():
