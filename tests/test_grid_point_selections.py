@@ -140,6 +140,7 @@ def grid_setup(monkeypatch):
 def run_grid(
     grid_setup, *, preview_channel, use_placeholder=False, x_range=1.0,
     corner_positions=None, x_count=None, y_count=None,
+    tilt_reference_points=None,
 ):
     core, viewer, main_window, _channels = grid_setup
     return utils.grid_point_selections(
@@ -159,6 +160,7 @@ def run_grid(
         corner_positions=corner_positions,
         x_count=x_count,
         y_count=y_count,
+        tilt_reference_points=tilt_reference_points,
     )
 
 
@@ -170,6 +172,7 @@ def test_centered_grid_still_uses_current_stage_xy(grid_setup):
     assert [(p.x, p.y) for p in sequence.stage_positions] == [
         (9.0, 20.0), (10.0, 20.0), (11.0, 20.0)
     ]
+    assert all(position.z == 3.0 for position in sequence.stage_positions)
 
 
 def test_corner_grid_normalizes_opposite_corner_directions(grid_setup):
@@ -234,6 +237,62 @@ def test_grid_rejects_only_one_axis_count(grid_setup):
             preview_channel=None,
             x_count=3,
         )
+
+
+def test_tilt_plane_fit_recovers_slopes_and_offset():
+    references = [
+        (0.0, 0.0, 1.0),
+        (1.0, 0.0, 3.0),
+        (0.0, 1.0, 4.0),
+        (1.0, 1.0, 6.0),
+    ]
+
+    origin, coefficients, rmse = utils._fit_tilt_plane(references)
+
+    np.testing.assert_allclose(origin, [0.5, 0.5])
+    np.testing.assert_allclose(coefficients, [2.0, 3.0, 3.5])
+    assert rmse < 1e-12
+
+
+def test_grid_positions_receive_fitted_tilt_z(grid_setup):
+    references = [
+        (0.0, 0.0, 1.0),
+        (1.0, 0.0, 3.0),
+        (0.0, 1.0, 4.0),
+        (1.0, 1.0, 6.0),
+    ]
+    _sources, _autofocus_p, sequence = run_grid(
+        grid_setup,
+        preview_channel=None,
+        corner_positions=((0.0, 0.0), (1.0, 1.0)),
+        x_count=2,
+        y_count=2,
+        tilt_reference_points=references,
+    )
+
+    np.testing.assert_allclose(
+        [(position.x, position.y, position.z)
+         for position in sequence.stage_positions],
+        [(0.0, 0.0, 1.0), (0.0, 1.0, 4.0),
+         (1.0, 0.0, 3.0), (1.0, 1.0, 6.0)],
+    )
+
+
+def test_tilt_plane_rejects_collinear_xy_references():
+    with pytest.raises(ValueError, match="must not be collinear"):
+        utils._fit_tilt_plane([
+            (0.0, 0.0, 1.0),
+            (1.0, 1.0, 2.0),
+            (2.0, 2.0, 3.0),
+        ])
+
+
+def test_tilt_plane_requires_three_references():
+    with pytest.raises(ValueError, match="at least 3"):
+        utils._fit_tilt_plane([
+            (0.0, 0.0, 1.0),
+            (1.0, 0.0, 2.0),
+        ])
 
 
 def test_raman_grid_without_placeholder_runs_prescan(grid_setup):

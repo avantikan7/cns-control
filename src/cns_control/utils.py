@@ -35,6 +35,46 @@ def _grid_axis(start, stop, max_step=None, count=None):
     return np.linspace(start, stop, count)
 
 
+def _fit_tilt_plane(reference_points):
+    """Fit ``z = a*(x-x0) + b*(y-y0) + c`` to XYZ references."""
+    points = np.asarray(reference_points, dtype=float)
+    if (
+        points.ndim != 2
+        or points.shape[1] != 3
+        or len(points) < 3
+        or not np.all(np.isfinite(points))
+    ):
+        raise ValueError("tilt correction requires at least 3 finite XYZ points")
+
+    origin = points[:, :2].mean(axis=0)
+    centered_xy = points[:, :2] - origin
+    centered_z = points[:, 2] - points[:, 2].mean()
+    x = centered_xy[:, 0]
+    y = centered_xy[:, 1]
+    xx = float(x @ x)
+    yy = float(y @ y)
+    xy = float(x @ y)
+    xz = float(x @ centered_z)
+    yz = float(y @ centered_z)
+    determinant = xx * yy - xy * xy
+    scale = max(abs(xx * yy), abs(xy * xy), 1.0)
+    if abs(determinant) <= np.finfo(float).eps * scale * 10:
+        raise ValueError("tilt reference XY points must not be collinear")
+    coefficients = np.array([
+        (xz * yy - yz * xy) / determinant,
+        (yz * xx - xz * xy) / determinant,
+        points[:, 2].mean(),
+    ])
+    fitted = (
+        coefficients[0] * x
+        + coefficients[1] * y
+        + coefficients[2]
+    )
+    errors = fitted - points[:, 2]
+    rmse = float(np.sqrt(np.mean(errors ** 2)))
+    return origin, coefficients, rmse
+
+
 def _remove_grid_placeholder(viewer):
     """Remove the grid placeholder layer if a previous Raman grid created it."""
     try:
@@ -779,7 +819,8 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
                           use_placeholder=False,
                           autofocus_object='None',
                           corner_positions=None,
-                          x_count=None, y_count=None):
+                          x_count=None, y_count=None,
+                          tilt_reference_points=None):
     """
     Build a grid of stage positions, each carrying `repeats` copies of the
     SAME single fixed point (fov_x, fov_y). By default the grid is centered on
@@ -801,6 +842,10 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
     x_count, y_count : int or None
         Exact numbers of grid positions along X and Y, including endpoints.
         When omitted, ``x_step`` and ``y_step`` are treated as maximum spacing.
+    tilt_reference_points : sequence of (x, y, z) or None
+        Focused stage-space references used to fit a least-squares Z plane.
+        When provided, the fitted Z replaces the template Z at every grid
+        position. At least three non-collinear XY references are required.
 
     Writes the freshly-built grid of positions into the napari MDA widget and
     returns the (sources, autofocus_p, new_seq) contract the MDA expects. The
@@ -835,11 +880,32 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
         raise ValueError("x_count and y_count must be provided together")
     xs = _grid_axis(x_min, x_max, x_step, x_count)
     ys = _grid_axis(y_min, y_max, y_step, y_count)
+    tilt_model = (
+        None if tilt_reference_points is None
+        else _fit_tilt_plane(tilt_reference_points)
+    )
+    if tilt_model is not None:
+        origin, coefficients, rmse = tilt_model
+        print(
+            "[grid setup] tilt plane "
+            f"origin=({origin[0]:.4f}, {origin[1]:.4f}), "
+            f"dZ/dX={coefficients[0]:.8f}, "
+            f"dZ/dY={coefficients[1]:.8f}, RMSE={rmse:.6f} um"
+        )
     template = seq.stage_positions[0]
     grid_positions = []
     for gx in xs:
         for gy in ys:
-            grid_positions.append(template.replace(x=float(gx), y=float(gy)))
+            position_values = {"x": float(gx), "y": float(gy)}
+            if tilt_model is not None:
+                origin, coefficients, _rmse = tilt_model
+                centered_xy = np.array([gx, gy]) - origin
+                position_values["z"] = float(
+                    coefficients[0] * centered_xy[0]
+                    + coefficients[1] * centered_xy[1]
+                    + coefficients[2]
+                )
+            grid_positions.append(template.replace(**position_values))
     new_seq = seq.replace(stage_positions=grid_positions)
 
     # Write the generated positions into the napari MDA widget so the later
