@@ -141,6 +141,7 @@ def run_grid(
     grid_setup, *, preview_channel, use_placeholder=False, x_range=1.0,
     corner_positions=None, x_count=None, y_count=None,
     tilt_reference_points=None,
+    tilt_degree=1,
     snake_axis=None,
 ):
     core, viewer, main_window, _channels = grid_setup
@@ -162,6 +163,7 @@ def run_grid(
         x_count=x_count,
         y_count=y_count,
         tilt_reference_points=tilt_reference_points,
+        tilt_degree=tilt_degree,
         snake_axis=snake_axis,
     )
 
@@ -319,7 +321,7 @@ def test_grid_positions_receive_fitted_tilt_z(grid_setup):
 
 
 def test_tilt_plane_rejects_collinear_xy_references():
-    with pytest.raises(ValueError, match="must not be collinear"):
+    with pytest.raises(ValueError, match="do not constrain"):
         utils._fit_tilt_plane([
             (0.0, 0.0, 1.0),
             (1.0, 1.0, 2.0),
@@ -333,6 +335,39 @@ def test_tilt_plane_requires_three_references():
             (0.0, 0.0, 1.0),
             (1.0, 0.0, 2.0),
         ])
+
+
+def test_degree_two_vandermonde_corrects_curved_grid_z(grid_setup):
+    def curved_z(x, y):
+        return 1.0 + 2.0*x + 3.0*y + 4.0*x*x + 5.0*x*y + 6.0*y*y
+
+    references = [
+        (x, y, curved_z(x, y))
+        for x in (-1.0, 0.0, 1.0)
+        for y in (-1.0, 0.0, 1.0)
+    ]
+    _sources, _autofocus_p, sequence = run_grid(
+        grid_setup,
+        preview_channel=None,
+        corner_positions=((-1.0, -1.0), (1.0, 1.0)),
+        x_count=3,
+        y_count=3,
+        tilt_reference_points=references,
+        tilt_degree=2,
+    )
+
+    for position in sequence.stage_positions:
+        assert np.isclose(position.z, curved_z(position.x, position.y))
+
+
+def test_degree_two_tilt_fit_requires_six_references():
+    with pytest.raises(ValueError, match="requires at least 6"):
+        utils._fit_tilt_surface([
+            (0.0, 0.0, 1.0),
+            (1.0, 0.0, 2.0),
+            (0.0, 1.0, 3.0),
+            (1.0, 1.0, 4.0),
+        ], degree=2)
 
 
 def test_raman_grid_without_placeholder_runs_prescan(grid_setup):

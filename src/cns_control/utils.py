@@ -2,6 +2,7 @@ import json
 import time
 
 import numpy as np
+from scipy.linalg import lstsq
 from skimage.draw import disk
 from scipy.ndimage import center_of_mass, distance_transform_edt
 from tqdm.auto import tqdm
@@ -35,44 +36,74 @@ def _grid_axis(start, stop, max_step=None, count=None):
     return np.linspace(start, stop, count)
 
 
-def _fit_tilt_plane(reference_points):
-    """Fit ``z = a*(x-x0) + b*(y-y0) + c`` to XYZ references."""
+def _tilt_vandermonde_design(xy, degree):
+    """Build [1, x, y, x^2, xy, y^2, ...] through ``degree``."""
+    xy = np.atleast_2d(np.asarray(xy, dtype=float))
+    x, y = xy[:, 0], xy[:, 1]
+    terms = []
+    for total_degree in range(degree + 1):
+        for x_power in range(total_degree, -1, -1):
+            y_power = total_degree - x_power
+            terms.append((x ** x_power) * (y ** y_power))
+    return np.stack(terms, axis=1)
+
+
+def _fit_tilt_surface(reference_points, degree=1):
+    """Fit a centered/scaled 2D Vandermonde Z surface."""
+    degree = int(degree)
+    if degree < 1 or degree > 3:
+        raise ValueError("tilt fit degree must be between 1 and 3")
     points = np.asarray(reference_points, dtype=float)
+    term_count = (degree + 1) * (degree + 2) // 2
     if (
         points.ndim != 2
         or points.shape[1] != 3
-        or len(points) < 3
+        or len(points) < term_count
         or not np.all(np.isfinite(points))
     ):
-        raise ValueError("tilt correction requires at least 3 finite XYZ points")
+        raise ValueError(
+            f"degree {degree} tilt correction requires at least "
+            f"{term_count} finite XYZ points"
+        )
 
     origin = points[:, :2].mean(axis=0)
     centered_xy = points[:, :2] - origin
-    centered_z = points[:, 2] - points[:, 2].mean()
-    x = centered_xy[:, 0]
-    y = centered_xy[:, 1]
-    xx = float(x @ x)
-    yy = float(y @ y)
-    xy = float(x @ y)
-    xz = float(x @ centered_z)
-    yz = float(y @ centered_z)
-    determinant = xx * yy - xy * xy
-    scale = max(abs(xx * yy), abs(xy * xy), 1.0)
-    if abs(determinant) <= np.finfo(float).eps * scale * 10:
-        raise ValueError("tilt reference XY points must not be collinear")
-    coefficients = np.array([
-        (xz * yy - yz * xy) / determinant,
-        (yz * xx - xz * xy) / determinant,
-        points[:, 2].mean(),
-    ])
-    fitted = (
-        coefficients[0] * x
-        + coefficients[1] * y
-        + coefficients[2]
+    scale = np.max(np.abs(centered_xy), axis=0)
+    if np.any(scale <= np.finfo(float).eps):
+        raise ValueError("tilt reference XY points must span both X and Y")
+    normalized_xy = centered_xy / scale
+    design = _tilt_vandermonde_design(normalized_xy, degree)
+    coefficients, _residuals, rank, _singular_values = lstsq(
+        design, points[:, 2]
     )
+    if rank < term_count:
+        raise ValueError(
+            f"tilt reference XY points do not constrain a degree {degree} fit"
+        )
+    fitted = design @ coefficients
     errors = fitted - points[:, 2]
     rmse = float(np.sqrt(np.mean(errors ** 2)))
-    return origin, coefficients, rmse
+    return origin, scale, coefficients, rmse
+
+
+def _evaluate_tilt_surface(xy, model, degree):
+    """Evaluate a fitted tilt surface at one or more stage XY positions."""
+    origin, scale, coefficients, _rmse = model
+    normalized_xy = (np.atleast_2d(xy) - origin) / scale
+    return _tilt_vandermonde_design(normalized_xy, degree) @ coefficients
+
+
+def _fit_tilt_plane(reference_points):
+    """Backward-compatible degree-1 tilt fit with physical X/Y slopes."""
+    origin, scale, coefficients, rmse = _fit_tilt_surface(
+        reference_points, degree=1
+    )
+    physical_coefficients = np.array([
+        coefficients[1] / scale[0],
+        coefficients[2] / scale[1],
+        coefficients[0],
+    ])
+    return origin, physical_coefficients, rmse
 
 
 def _ordered_grid_coordinates(xs, ys, snake_axis=None):
@@ -841,6 +872,7 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
                           corner_positions=None,
                           x_count=None, y_count=None,
                           tilt_reference_points=None,
+                          tilt_degree=1,
                           snake_axis=None):
     """
     Build a grid of stage positions, each carrying `repeats` copies of the
@@ -864,9 +896,13 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
         Exact numbers of grid positions along X and Y, including endpoints.
         When omitted, ``x_step`` and ``y_step`` are treated as maximum spacing.
     tilt_reference_points : sequence of (x, y, z) or None
-        Focused stage-space references used to fit a least-squares Z plane.
+        Focused stage-space references used to fit a least-squares Z surface.
         When provided, the fitted Z replaces the template Z at every grid
-        position. At least three non-collinear XY references are required.
+        position. References must be sufficiently distributed to constrain the
+        selected degree.
+    tilt_degree : int
+        Total degree of the centered/scaled 2D Vandermonde Z surface (1--3).
+        The required reference count is (degree + 1)(degree + 2)/2.
     snake_axis : {'x', 'y'} or None
         Fast axis for snake traversal. X reverses direction on alternating Y
         rows; Y reverses direction on alternating X columns. None preserves
@@ -908,27 +944,24 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
     ys = _grid_axis(y_min, y_max, y_step, y_count)
     tilt_model = (
         None if tilt_reference_points is None
-        else _fit_tilt_plane(tilt_reference_points)
+        else _fit_tilt_surface(tilt_reference_points, tilt_degree)
     )
     if tilt_model is not None:
-        origin, coefficients, rmse = tilt_model
+        origin, _scale, _coefficients, rmse = tilt_model
         print(
-            "[grid setup] tilt plane "
+            f"[grid setup] degree {tilt_degree} tilt surface "
             f"origin=({origin[0]:.4f}, {origin[1]:.4f}), "
-            f"dZ/dX={coefficients[0]:.8f}, "
-            f"dZ/dY={coefficients[1]:.8f}, RMSE={rmse:.6f} um"
+            f"RMSE={rmse:.6f} um"
         )
     template = seq.stage_positions[0]
     grid_positions = []
     for gx, gy in _ordered_grid_coordinates(xs, ys, snake_axis):
         position_values = {"x": float(gx), "y": float(gy)}
         if tilt_model is not None:
-            origin, coefficients, _rmse = tilt_model
-            centered_xy = np.array([gx, gy]) - origin
             position_values["z"] = float(
-                coefficients[0] * centered_xy[0]
-                + coefficients[1] * centered_xy[1]
-                + coefficients[2]
+                _evaluate_tilt_surface(
+                    np.array([gx, gy]), tilt_model, tilt_degree
+                )[0]
             )
         grid_positions.append(template.replace(**position_values))
     new_seq = seq.replace(stage_positions=grid_positions)

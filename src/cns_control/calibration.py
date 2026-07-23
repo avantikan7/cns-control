@@ -95,15 +95,22 @@ class Calibrator:
 
         imgs = np.asarray(imgs)
         specs = np.asarray(specs)
+        wavenumbers = self.collector.get_wavenumbers(specs.shape[-1])
         self.core.setAutoShutter(True)
 
         ds = xr.Dataset(
             {
                 "laser_pos": xr.DataArray(volts[~too_big], dims=("idx", "volt")),
                 "imgs": xr.DataArray(imgs, dims=("idx", "Y", "X")),
-                "specs": xr.DataArray(specs, dims=("idx", "N", "spec_dim")),
+                "specs": xr.DataArray(
+                    specs, dims=("idx", "N", "wavenumber")
+                ),
                 "BF_bkd": xr.DataArray(self.core.snap(), dims=("Y", "X")),
-            }
+            },
+            coords={"wavenumber": wavenumbers},
+        )
+        ds["wavenumber"].attrs.update(
+            units="cm^-1", long_name="Raman shift"
         )
 
         if relative_pos is not None:
