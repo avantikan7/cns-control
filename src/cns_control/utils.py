@@ -1,4 +1,3 @@
-import json
 import time
 
 import numpy as np
@@ -8,6 +7,7 @@ from scipy.ndimage import center_of_mass, distance_transform_edt
 from tqdm.auto import tqdm
 
 from raman_mda_engine.aiming.autotracking import segment_single_img
+from .vandermonde import load_vandermonde_model
 
 
 # Values that mean "do not use an autofocus object / layer".
@@ -135,23 +135,6 @@ def _remove_grid_placeholder(viewer):
     viewer.layers.remove(layer)
 
 
-def _set_grid_placeholder(viewer, n_positions):
-    """Create or update a tiny hidden 6-D layer that exposes the position axis."""
-    data = np.zeros((1, n_positions, 1, 1, 1, 1), dtype=np.uint8)
-    try:
-        layer = viewer.layers[_GRID_PLACEHOLDER_LAYER]
-    except (KeyError, TypeError):
-        return viewer.add_image(
-            data,
-            name=_GRID_PLACEHOLDER_LAYER,
-            visible=False,
-        )
-
-    layer.data = data
-    layer.visible = False
-    return layer
-
-
 def _grid_preview_sequence(sequence, preview_channel):
     """Return a one-channel preview sequence without modifying the Raman plan."""
     if sequence.channels:
@@ -187,37 +170,6 @@ def _segment_single_img(image, *, scale):
 def _is_no_autofocus(autofocus_object) -> bool:
     """True when the caller has asked for no autofocus object."""
     return autofocus_object in _NO_AUTOFOCUS
-
-
-# ---------------------------------------------------------------------------
-# Vandermonde pixel-offset -> stage-offset model
-# ---------------------------------------------------------------------------
-
-def load_vandermonde_model(json_path):
-    """
-    Load a fitted Vandermonde pixel-offset -> stage-offset model from JSON.
-
-    Expected JSON structure (as produced by `fit_vandermonde` earlier):
-        {
-            "degree": <int>,
-            "C": <list, shape (n_terms, 2)>
-        }
-
-    IMPORTANT: this model must have been fit on (pixel offset from image
-    center) -> (stage offset) pairs, NOT on absolute pixel/stage positions.
-    Fitting on absolute positions (with a bias/intercept term) and then
-    applying it to a centered offset will give the wrong answer.
-
-    Returns
-    -------
-    C : np.ndarray, shape (n_terms, 2)
-    degree : int
-    """
-    with open(json_path) as f:
-        model = json.load(f)
-    C = np.array(model["C"])
-    degree = int(model["degree"])
-    return C, degree
 
 
 def _vandermonde_design(src, degree):
@@ -362,6 +314,41 @@ def create_point_sources(viewer,
                 )
         viewer.add_layer(points)
         sources.append(PointsLayerSource(points, name=name, transformer=point_transformer))
+    return sources
+
+
+def _create_fixed_grid_sources(
+    core,
+    point_transformer,
+    fov_x,
+    fov_y,
+    repeats,
+    include_autofocus,
+):
+    """Create fixed grid sources without allocating napari points per position."""
+    from raman_mda_engine.aiming import FixedPointsSource
+
+    image_shape = core.getImageWidth(), core.getImageHeight()
+    cell_points = np.repeat(
+        np.array([[fov_y, fov_x]], dtype=float), repeats, axis=0
+    )
+    sources = [
+        FixedPointsSource(
+            cell_points,
+            name="cells",
+            img_shape=image_shape,
+            transformer=point_transformer,
+        )
+    ]
+    if include_autofocus:
+        sources.append(
+            FixedPointsSource(
+                np.array([[fov_y, fov_x]], dtype=float),
+                name="autofocus",
+                img_shape=image_shape,
+                transformer=point_transformer,
+            )
+        )
     return sources
 
 
@@ -518,7 +505,8 @@ def get_n_most_centered_coms(
 def automated_point_selections(
     core, viewer, main_window, point_transformer, N,
     center=None, radius=250, autofocus_object='glass', bkd_thres=50, batch=True,
-    center_cell=False, vandermonde_model_path=None, cellpose_model='cyto2'
+    center_cell=False, vandermonde_model_path=None, cellpose_model='cyto2',
+    objective=None,
 ):
     """
     Parameters
@@ -552,6 +540,9 @@ def automated_point_selections(
         Path to a JSON file with the fitted model (see
         `load_vandermonde_model`). Required when `center_cell=True`. Must be
         fit on (pixel offset from image center) -> (stage offset) pairs.
+    objective : str or None
+        Objective device state index, represented as a string, used to choose
+        one calibration from a multi-objective model. Ignored by legacy files.
 
     Returns
     -------
@@ -566,7 +557,9 @@ def automated_point_selections(
     if center_cell:
         if vandermonde_model_path is None:
             raise ValueError("vandermonde_model_path must be provided when center_cell=True")
-        C, degree = load_vandermonde_model(vandermonde_model_path)
+        C, degree = load_vandermonde_model(
+            vandermonde_model_path, objective=objective
+        )
 
     seq = _get_seq_from_napari(main_window)
     images = []
@@ -776,7 +769,8 @@ def manual_point_selections(core, viewer, main_window, point_transformer, N,
     
 def center_manual_selections(core, viewer, main_window, point_transformer,
                              sources, vandermonde_model_path,
-                             autofocus_object='glass', center=None):
+                             autofocus_object='glass', center=None,
+                             objective=None):
     """
     Convert hand-clicked cell points into centered stage positions.
 
@@ -789,13 +783,18 @@ def center_manual_selections(core, viewer, main_window, point_transformer,
     NOTE: only valid after a NON-batch manual selection (batch repeats
     positions, which breaks the p -> stage-position mapping used here).
 
+    ``objective`` is the Micro-Manager preset used to select a calibration
+    from a multi-objective Vandermonde JSON file. Legacy files ignore it.
+
     Returns
     -------
     sources, autofocus_p, new_seq : same 3-tuple contract as the other
         selection functions. autofocus_p = np.arange(n_new).
     """
     no_autofocus = _is_no_autofocus(autofocus_object)
-    C, degree = load_vandermonde_model(vandermonde_model_path)
+    C, degree = load_vandermonde_model(
+        vandermonde_model_path, objective=objective
+    )
     seq = _get_seq_from_napari(main_window)
     img_y = int(core.getImageHeight())
     img_x = int(core.getImageWidth())
@@ -885,8 +884,8 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
 
     ``preview_channel`` selects the channel used to image the grid before Raman.
     Passing ``None`` runs the sequence's normal pre-scan. If ``use_placeholder``
-    is true, that pre-scan is skipped and a hidden placeholder layer establishes
-    napari's position axis instead.
+    is true, that pre-scan and napari position layers are skipped; fixed points
+    are generated procedurally for each MDA event.
 
     corner_positions : ((x1, y1), (x2, y2)) or None
         Opposite stage-space corners of the grid. Coordinate order is
@@ -909,9 +908,10 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
         the original raster order. The resulting position order is shared by
         every acquisition channel in the MDA sequence.
 
-    Writes the freshly-built grid of positions into the napari MDA widget and
-    returns the (sources, autofocus_p, new_seq) contract the MDA expects. The
-    returned sequence always keeps its original Raman acquisition channels.
+    For normal previews, writes the grid into the napari MDA widget. Compact
+    placeholder mode bypasses that expensive editor update and returns the
+    generated sequence directly. The returned sequence always keeps its
+    original Raman acquisition channels.
     autofocus_object : str or None
         If a real focus target ('glass', 'quartz', 'laser', 'software',
         'cell'), an 'autofocus' layer is also created with one point per
@@ -966,56 +966,70 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
         grid_positions.append(template.replace(**position_values))
     new_seq = seq.replace(stage_positions=grid_positions)
 
-    # Write the generated positions into the napari MDA widget so the later
-    # Raman MDA uses the same grid regardless of the preview mode.
-    try:
-        mda_settings = _get_mda_widget_from_napari(main_window)
-        if hasattr(mda_settings, "setValue"):
-            mda_settings.setValue(new_seq)
-            new_seq = _get_seq_from_napari(main_window)  # read back the truth
+    compact_mode = preview_channel is None and use_placeholder
+    if compact_mode:
+        sources = _create_fixed_grid_sources(
+            core,
+            point_transformer,
+            fov_x,
+            fov_y,
+            repeats,
+            include_autofocus=not no_autofocus,
+        )
+        _remove_grid_placeholder(viewer)
+        print(
+            "[grid setup] compact grid ready "
+            f"({len(new_seq.stage_positions)} positions, no napari layers)"
+        )
+    else:
+        # Keep the editable, visible workflow for previewed grids.
+        try:
+            mda_settings = _get_mda_widget_from_napari(main_window)
+            if hasattr(mda_settings, "setValue"):
+                mda_settings.setValue(new_seq)
+                new_seq = _get_seq_from_napari(main_window)
+            else:
+                print(
+                    "[grid setup] MDA widget has no setValue -- "
+                    "grid may not show"
+                )
+        except Exception as e:
+            print(f"[grid setup] couldn't write positions to MDA widget: {e}")
+
+        if no_autofocus:
+            sources = create_point_sources(
+                viewer, point_transformer, size=15,
+                names=['cells'], colors=['#aa0000ff'],
+            )
         else:
-            print("[grid setup] MDA widget has no setValue -- grid may not show")
-    except Exception as e:
-        print(f"[grid setup] couldn't write positions to MDA widget: {e}")
-    if no_autofocus:
-        sources = create_point_sources(
-            viewer, point_transformer, size=15,
-            names=['cells'], colors=['#aa0000ff'],
-        )
-    else:
-        sources = create_point_sources(viewer, point_transformer, size=15)
+            sources = create_point_sources(
+                viewer, point_transformer, size=15
+            )
 
-    # Establish napari's position dimension without changing the sequence that
-    # the later Raman MDA consumes. A real channel gets a temporary one-channel
-    # preview sequence; Raman mode either runs the original sequence or uses a
-    # tiny hidden placeholder layer instead.
-    if preview_channel is None and use_placeholder:
-        _set_grid_placeholder(viewer, len(new_seq.stage_positions))
-        print("[grid setup] grid ready using Raman placeholders")
-    elif preview_channel is None:
         _remove_grid_placeholder(viewer)
-        core.run_mda(new_seq)
-        print("[grid setup] grid ready after Raman pre-scan")
-    else:
-        _remove_grid_placeholder(viewer)
-        preview_seq = _grid_preview_sequence(new_seq, preview_channel)
-        core.run_mda(preview_seq)
-        print(f"[grid setup] grid ready after {preview_channel} preview")
+        if preview_channel is None:
+            core.run_mda(new_seq)
+            print("[grid setup] grid ready after Raman pre-scan")
+        else:
+            preview_seq = _grid_preview_sequence(new_seq, preview_channel)
+            core.run_mda(preview_seq)
+            print(f"[grid setup] grid ready after {preview_channel} preview")
 
-    # Place `repeats` identical points at (fov_x, fov_y) for every position.
-    # Row order (.., y, x) matches the other selection functions.
-    for p in range(len(new_seq.stage_positions)):
-        for _ in range(repeats):
-            sources[0]._points.add([0, p, 0, 0, fov_y, fov_x])
-    if not no_autofocus:
-        n_pos = len(new_seq.stage_positions)
-        # one autofocus point per position, at the same fixed FOV pixel
-        af_pts = np.array(
-            [[0, p, 0, 0, fov_y, fov_x] for p in range(n_pos)],
-            dtype=float,
-        )
-        sources[1]._points.add(af_pts)
-    return sources, np.arange(len(new_seq.stage_positions)), new_seq
+        # Row order (.., y, x) matches the other selection functions.
+        for p in range(len(new_seq.stage_positions)):
+            for _ in range(repeats):
+                sources[0]._points.add([0, p, 0, 0, fov_y, fov_x])
+        if not no_autofocus:
+            n_pos = len(new_seq.stage_positions)
+            af_pts = np.array(
+                [[0, p, 0, 0, fov_y, fov_x] for p in range(n_pos)],
+                dtype=float,
+            )
+            sources[1]._points.add(af_pts)
+
+    # A range keeps membership checks O(1) without allocating another
+    # position-sized numpy array.
+    return sources, range(len(new_seq.stage_positions)), new_seq
 def unload(core, N=20):
     n = 0.1  # starting sleep time
     for attempt in range(N):

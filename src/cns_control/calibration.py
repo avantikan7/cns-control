@@ -3,7 +3,6 @@ import xarray as xr
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import trange, tqdm
-import json
 import time
 import scipy.ndimage as ndi
 from raman_mda_engine.aiming import (
@@ -13,6 +12,7 @@ from skimage.measure import ransac, CircleModel, label
 from scipy.ndimage import center_of_mass, binary_dilation
 from matplotlib.widgets import RectangleSelector
 from .coordtransformer import CoordTransformer
+from .vandermonde import save_vandermonde_model
 from scipy.interpolate import griddata
 
 __all__ = [
@@ -428,22 +428,6 @@ def fit_vandermonde(pts, targets, degree):
  
 def apply_vandermonde(pts, C, degree):
     return _vandermonde_terms(pts, degree) @ C
- 
- 
-def save_vandermonde_model(json_path, C, degree, img_center=None, xy_center=None):
-    """Save in the format load_vandermonde_model expects.
- 
-    img_center / xy_center are stored as extra keys for reference
-    (dict-based loaders that only read "degree" and "C" ignore them).
-    """
-    model = {"degree": int(degree), "C": np.asarray(C).tolist()}
-    if img_center is not None:
-        model["img_center"] = np.asarray(img_center).tolist()
-    if xy_center is not None:
-        model["xy_center"] = np.asarray(xy_center).tolist()
-    with open(json_path, "w") as f:
-        json.dump(model, f, indent=2)
-    print(f"Saved Vandermonde model (degree={degree}) to {json_path}")
  
  
 # ---------------- StagePointPicker ----------------

@@ -43,6 +43,12 @@ class FakeCore:
     def getXYPosition(self):
         return 10.0, 20.0
 
+    def getImageWidth(self):
+        return 1344
+
+    def getImageHeight(self):
+        return 1024
+
     def run_mda(self, sequence):
         self.run_calls.append(sequence)
 
@@ -58,6 +64,12 @@ class FakePoints:
 class FakeSource:
     def __init__(self):
         self._points = FakePoints()
+
+
+class FakeFixedSource:
+    def __init__(self, points, name):
+        self._base_points = np.asarray(points, dtype=float)
+        self.name = name
 
 
 class FakeLayer:
@@ -93,8 +105,10 @@ class FakeViewer:
 class FakeMDASettings:
     def __init__(self, sequence_holder):
         self._sequence_holder = sequence_holder
+        self.set_value_calls = 0
 
     def setValue(self, sequence):
+        self.set_value_calls += 1
         self._sequence_holder[0] = sequence
 
 
@@ -108,8 +122,8 @@ class FakeDock:
 
 class FakeMainWindow:
     def __init__(self, sequence_holder):
-        settings = FakeMDASettings(sequence_holder)
-        self._dock_widgets = {"MDA": FakeDock(settings)}
+        self.settings = FakeMDASettings(sequence_holder)
+        self._dock_widgets = {"MDA": FakeDock(self.settings)}
 
 
 @pytest.fixture
@@ -133,6 +147,20 @@ def grid_setup(monkeypatch):
         "create_point_sources",
         lambda *_args, **_kwargs: [FakeSource()],
     )
+    monkeypatch.setattr(
+        utils,
+        "_create_fixed_grid_sources",
+        lambda _core, _transformer, fov_x, fov_y, repeats,
+        include_autofocus: [
+            FakeFixedSource(
+                np.repeat([[fov_y, fov_x]], repeats, axis=0), "cells"
+            ),
+            *(
+                [FakeFixedSource([[fov_y, fov_x]], "autofocus")]
+                if include_autofocus else []
+            ),
+        ],
+    )
 
     return core, viewer, main_window, original_channels
 
@@ -143,6 +171,7 @@ def run_grid(
     tilt_reference_points=None,
     tilt_degree=1,
     snake_axis=None,
+    autofocus_object="None",
 ):
     core, viewer, main_window, _channels = grid_setup
     return utils.grid_point_selections(
@@ -165,6 +194,7 @@ def run_grid(
         tilt_reference_points=tilt_reference_points,
         tilt_degree=tilt_degree,
         snake_axis=snake_axis,
+        autofocus_object=autofocus_object,
     )
 
 
@@ -388,36 +418,56 @@ def test_raman_grid_without_placeholder_runs_prescan(grid_setup):
     assert all(point[-2:] == [222, 111] for point in sources[0]._points.data)
 
 
-def test_raman_grid_uses_placeholders_without_running_mda(grid_setup):
-    core, viewer, _main_window, original_channels = grid_setup
+def test_raman_grid_uses_compact_sources_without_running_mda(grid_setup):
+    core, viewer, main_window, original_channels = grid_setup
 
-    _sources, _autofocus_p, sequence = run_grid(
+    sources, autofocus_p, sequence = run_grid(
         grid_setup, preview_channel=None, use_placeholder=True
     )
 
     assert core.run_calls == []
-    placeholder = viewer.layers[utils._GRID_PLACEHOLDER_LAYER]
-    assert placeholder.data.shape == (1, 3, 1, 1, 1, 1)
-    assert placeholder.data.dtype == np.uint8
-    assert placeholder.visible is False
-    assert viewer.add_image_calls == 1
+    with pytest.raises(KeyError):
+        viewer.layers[utils._GRID_PLACEHOLDER_LAYER]
+    assert viewer.add_image_calls == 0
+    assert main_window.settings.set_value_calls == 0
+    assert len(sources) == 1
+    np.testing.assert_array_equal(
+        sources[0]._base_points, [[222, 111], [222, 111]]
+    )
+    np.testing.assert_array_equal(autofocus_p, np.arange(3))
     assert sequence.channels == original_channels
 
 
-def test_raman_grid_updates_existing_placeholder(grid_setup):
-    _core, viewer, _main_window, _channels = grid_setup
-    run_grid(grid_setup, preview_channel=None, use_placeholder=True)
-
-    run_grid(
+def test_large_compact_grid_storage_does_not_scale_with_position_count(
+    grid_setup,
+):
+    _core, viewer, main_window, _channels = grid_setup
+    sources, autofocus_p, sequence = run_grid(
         grid_setup,
         preview_channel=None,
         use_placeholder=True,
-        x_range=2.0,
+        corner_positions=((0.0, 0.0), (1.0, 0.0)),
+        x_count=20_000,
+        y_count=1,
     )
 
-    placeholder = viewer.layers[utils._GRID_PLACEHOLDER_LAYER]
-    assert placeholder.data.shape == (1, 5, 1, 1, 1, 1)
-    assert viewer.add_image_calls == 1
+    assert len(sequence.stage_positions) == 20_000
+    assert len(autofocus_p) == 20_000
+    assert sources[0]._base_points.shape == (2, 2)
+    assert main_window.settings.set_value_calls == 0
+    assert viewer.add_image_calls == 0
+
+
+def test_compact_grid_adds_one_fixed_autofocus_point(grid_setup):
+    sources, _autofocus_p, _sequence = run_grid(
+        grid_setup,
+        preview_channel=None,
+        use_placeholder=True,
+        autofocus_object="laser",
+    )
+
+    assert [source.name for source in sources] == ["cells", "autofocus"]
+    np.testing.assert_array_equal(sources[1]._base_points, [[222, 111]])
 
 
 def test_real_channel_previews_once_and_preserves_raman_channels(grid_setup):
