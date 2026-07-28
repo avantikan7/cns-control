@@ -6,7 +6,6 @@ from skimage.draw import disk
 from scipy.ndimage import center_of_mass, distance_transform_edt
 from tqdm.auto import tqdm
 
-from raman_mda_engine.aiming.autotracking import segment_single_img
 from .vandermonde import load_vandermonde_model
 
 
@@ -160,11 +159,11 @@ def _get_mda_widget_from_napari(main_window):
     return get_mda_widget_from_napari(main_window)
 
 
-def _segment_single_img(image, *, scale):
+def _segment_single_img(image, **kwargs):
     """Load the optional Cellpose stack only for automated segmentation."""
     from raman_mda_engine.aiming.autotracking import segment_single_img
 
-    return segment_single_img(image, scale=scale)
+    return segment_single_img(image, **kwargs)
 
 
 def _is_no_autofocus(autofocus_object) -> bool:
@@ -407,9 +406,15 @@ def set_up_new_seq(main_window, point_transformer, engine, seq=None, total_expos
     num_z = seq.z_plan.num_positions()
     # add in raman metadata to do raman
     if z_plan == 'all':
-        new_meta["raman"] = {"z": np.arange(num_z).tolist()} # do all Zs
+        new_meta["raman"] = {
+            "channel": "RM",
+            "z": np.arange(num_z).tolist(),
+        }  # do all Zs
     elif z_plan == 'middle':
-        new_meta["raman"] = {"z": [num_z//2]} # only do the middle Z
+        new_meta["raman"] = {
+            "channel": "RM",
+            "z": [num_z//2],
+        }  # only do the middle Z
     else:
         raise ValueError('Please choose a valid z_plan: middle or all')
     new_seq = seq.replace(metadata=new_meta)
@@ -455,7 +460,7 @@ def get_n_most_centered_coms(
     N : int
         Number of points to return.
     center : tuple or None
-        (y, x) center to compare distances. Defaults to [672, 512].
+        (y, x) center to compare distances. Defaults to the image center.
     radius : float
         Max distance from center to include a point. Pass np.inf for no limit.
     autofocus_object : str or None
@@ -472,7 +477,7 @@ def get_n_most_centered_coms(
     labels = labels[labels != 0]  # ignore background
 
     if center is None:
-        center = np.array([672, 512])
+        center = np.array(label_mask.shape) / 2
     else:
         center = np.array(center)
 
@@ -578,7 +583,16 @@ def automated_point_selections(
         core.waitForSystem()
         time.sleep(1)
         images.append(image)
-        mask = segment_single_img(image, scale=1, cellpose_model=cellpose_model, circle_center=center, circle_radius = radius)
+        circle_center_xy = (
+            None if center is None else (center[1], center[0])
+        )
+        mask = _segment_single_img(
+            image,
+            scale=1,
+            cellpose_model=cellpose_model,
+            circle_center=circle_center_xy,
+            circle_radius=radius,
+        )
         masks.append(mask)
 
         if center_cell:
