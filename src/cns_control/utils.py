@@ -511,7 +511,7 @@ def automated_point_selections(
     core, viewer, main_window, point_transformer, N,
     center=None, radius=250, autofocus_object='glass', bkd_thres=50, batch=True,
     center_cell=False, vandermonde_model_path=None, cellpose_model='cyto2',
-    objective=None,
+    objective=None, segmentation_channel='BF',
 ):
     """
     Parameters
@@ -548,6 +548,10 @@ def automated_point_selections(
     objective : str or None
         Objective device state index, represented as a string, used to choose
         one calibration from a multi-objective model. Ignored by legacy files.
+    segmentation_channel : str, optional
+        Micro-Manager imaging preset used for the Cellpose input frame.
+        Defaults to ``"BF"`` so selection cannot inherit an active RM laser
+        preset from autofocus.
 
     Returns
     -------
@@ -571,6 +575,13 @@ def automated_point_selections(
     masks = []
     points = []          # per ORIGINAL position: raw detected point(s), pixel coords (y, x)
     new_positions = []   # only populated when center_cell=True -- one entry per detected cell
+
+    # Selection must not inherit the RM preset left by laser autofocus.  In
+    # particular, that preset holds the Raman laser shutter open and its spot
+    # can hide a cell from Cellpose.  Switch explicitly to the requested
+    # imaging preset before any frame used for segmentation is acquired.
+    core.setConfig("Channel", segmentation_channel)
+    core.waitForConfig("Channel", segmentation_channel)
 
     for i in tqdm(range(len(seq.stage_positions))):
         orig_pos = seq.stage_positions[i]

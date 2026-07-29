@@ -31,15 +31,22 @@ class _Points:
 class _Core:
     def __init__(self):
         self.run_calls = []
+        self.calls = []
+
+    def setConfig(self, group, config):
+        self.calls.append(("setConfig", group, config))
+
+    def waitForConfig(self, group, config):
+        self.calls.append(("waitForConfig", group, config))
 
     def setXYPosition(self, _x, _y):
-        pass
+        self.calls.append(("setXYPosition",))
 
     def waitForSystem(self):
         pass
 
     def snapImage(self):
-        pass
+        self.calls.append(("snapImage",))
 
     def getImage(self):
         return np.zeros((8, 10), dtype=np.uint16)
@@ -74,8 +81,9 @@ def test_automated_selection_converts_napari_yx_to_segmentation_xy(
         lambda *_args, **_kwargs: [source],
     )
 
+    core = _Core()
     utils.automated_point_selections(
-        _Core(),
+        core,
         viewer=object(),
         main_window=object(),
         point_transformer=object(),
@@ -84,9 +92,17 @@ def test_automated_selection_converts_napari_yx_to_segmentation_xy(
         radius=3,
         autofocus_object=None,
         batch=True,
+        segmentation_channel="Phase",
     )
 
     assert captured["circle_center"] == (2, 5)
+    assert core.calls[:2] == [
+        ("setConfig", "Channel", "Phase"),
+        ("waitForConfig", "Channel", "Phase"),
+    ]
+    assert core.calls.index(
+        ("setConfig", "Channel", "Phase")
+    ) < core.calls.index(("snapImage",))
 
 
 def test_centered_coms_default_to_label_image_center():
