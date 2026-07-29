@@ -6,6 +6,27 @@ import numpy as np
 from cns_control import utils
 
 
+def test_save_segmentation_debug_preserves_input_and_label_arrays(tmp_path):
+    image = np.array([[10, 20], [30, 40]], dtype=np.uint16)
+    labels = np.array([[0, 1], [2, 2]], dtype=np.int32)
+
+    image_path, labels_path = utils._save_segmentation_debug(
+        tmp_path,
+        position=3,
+        image=image,
+        labels=labels,
+    )
+
+    assert image_path.name == "position_0003_input.npy"
+    assert labels_path.name == "position_0003_labels.npy"
+    saved_image = np.load(image_path)
+    saved_labels = np.load(labels_path)
+    np.testing.assert_array_equal(saved_image, image)
+    np.testing.assert_array_equal(saved_labels, labels)
+    assert saved_image.dtype == image.dtype
+    assert saved_labels.dtype == labels.dtype
+
+
 @dataclass(frozen=True)
 class _Position:
     x: float
@@ -57,6 +78,8 @@ class _Core:
 
 def test_automated_selection_converts_napari_yx_to_segmentation_xy(
     monkeypatch,
+    tmp_path,
+    capsys,
 ):
     captured = {}
     sequence = _Sequence((_Position(1.0, 2.0),))
@@ -66,6 +89,7 @@ def test_automated_selection_converts_napari_yx_to_segmentation_xy(
 
     def fake_segment(_image, **kwargs):
         captured["circle_center"] = kwargs["circle_center"]
+        captured["diameter"] = kwargs["diameter"]
         return np.zeros((8, 10), dtype=np.uint16)
 
     monkeypatch.setattr(utils, "_segment_single_img", fake_segment)
@@ -93,9 +117,13 @@ def test_automated_selection_converts_napari_yx_to_segmentation_xy(
         autofocus_object=None,
         batch=True,
         segmentation_channel="Phase",
+        cell_diameter=None,
+        segmentation_debug_dir=tmp_path,
     )
 
     assert captured["circle_center"] == (2, 5)
+    assert captured["diameter"] is None
+    assert "diameter=model training" in capsys.readouterr().out
     assert core.calls[:2] == [
         ("setConfig", "Channel", "Phase"),
         ("waitForConfig", "Channel", "Phase"),
@@ -103,6 +131,14 @@ def test_automated_selection_converts_napari_yx_to_segmentation_xy(
     assert core.calls.index(
         ("setConfig", "Channel", "Phase")
     ) < core.calls.index(("snapImage",))
+    np.testing.assert_array_equal(
+        np.load(tmp_path / "position_0000_input.npy"),
+        np.zeros((8, 10), dtype=np.uint16),
+    )
+    np.testing.assert_array_equal(
+        np.load(tmp_path / "position_0000_labels.npy"),
+        np.zeros((8, 10), dtype=np.uint16),
+    )
 
 
 def test_centered_coms_default_to_label_image_center():

@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 
 import numpy as np
 from scipy.linalg import lstsq
@@ -12,6 +13,18 @@ from .vandermonde import load_vandermonde_model
 # Values that mean "do not use an autofocus object / layer".
 _NO_AUTOFOCUS = (None, "None", "none", "")
 _GRID_PLACEHOLDER_LAYER = "Grid position placeholders"
+
+
+def _save_segmentation_debug(directory, position, image, labels):
+    """Save one lossless segmentation input/label pair for debugging."""
+    directory = Path(directory).expanduser()
+    directory.mkdir(parents=True, exist_ok=True)
+    stem = f"position_{int(position):04d}"
+    image_path = directory / f"{stem}_input.npy"
+    labels_path = directory / f"{stem}_labels.npy"
+    np.save(image_path, np.asarray(image), allow_pickle=False)
+    np.save(labels_path, np.asarray(labels), allow_pickle=False)
+    return image_path, labels_path
 
 
 def _grid_axis(start, stop, max_step=None, count=None):
@@ -511,7 +524,8 @@ def automated_point_selections(
     core, viewer, main_window, point_transformer, N,
     center=None, radius=250, autofocus_object='glass', bkd_thres=50, batch=True,
     center_cell=False, vandermonde_model_path=None, cellpose_model='cyto2',
-    objective=None, segmentation_channel='BF',
+    objective=None, segmentation_channel='BF', segmentation_debug_dir=None,
+    cell_diameter=15,
 ):
     """
     Parameters
@@ -552,6 +566,12 @@ def automated_point_selections(
         Micro-Manager imaging preset used for the Cellpose input frame.
         Defaults to ``"BF"`` so selection cannot inherit an active RM laser
         preset from autofocus.
+    segmentation_debug_dir : path-like or None, optional
+        When provided, save the exact camera input and Cellpose label mask for
+        every original stage position as lossless ``.npy`` arrays.
+    cell_diameter : float or None, optional
+        Expected cell diameter in pixels in the original camera image.
+        ``None`` uses the diameter stored with the Cellpose model.
 
     Returns
     -------
@@ -603,8 +623,22 @@ def automated_point_selections(
             cellpose_model=cellpose_model,
             circle_center=circle_center_xy,
             circle_radius=radius,
+            diameter=cell_diameter,
         )
         masks.append(mask)
+        if segmentation_debug_dir is not None:
+            image_path, labels_path = _save_segmentation_debug(
+                segmentation_debug_dir,
+                i,
+                image,
+                mask,
+            )
+            print(
+                f"[segmentation debug] position={i}, "
+                f"labels={int(np.max(mask)) if np.size(mask) else 0}, "
+                f"diameter={cell_diameter if cell_diameter is not None else 'model training'}, "
+                f"input={image_path}, mask={labels_path}"
+            )
 
         if center_cell:
             # try to find up to N cells (+1 autofocus point if requested);
