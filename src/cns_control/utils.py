@@ -138,6 +138,40 @@ def _ordered_grid_coordinates(xs, ys, snake_axis=None):
             yield gx, gy
 
 
+def combine_grid_sequences(sequences):
+    """Flatten several grid sequences into one position axis.
+
+    All non-position sequence settings come from the first grid. Position
+    ranges for each constituent grid are recorded in JSON-compatible metadata
+    so saved acquisitions can recover the grid boundaries.
+    """
+    sequences = tuple(sequences)
+    if not sequences:
+        raise ValueError("at least one grid sequence is required")
+
+    positions = []
+    regions = []
+    for grid_index, sequence in enumerate(sequences, start=1):
+        start = len(positions)
+        positions.extend(sequence.stage_positions)
+        stop = len(positions)
+        regions.append(
+            {
+                "grid_index": grid_index,
+                "p_start": start,
+                "p_stop": stop,
+                "position_count": stop - start,
+            }
+        )
+
+    metadata = dict(getattr(sequences[0], "metadata", {}) or {})
+    metadata["grid_regions"] = regions
+    return sequences[0].replace(
+        stage_positions=tuple(positions),
+        metadata=metadata,
+    )
+
+
 def _remove_grid_placeholder(viewer):
     """Remove the grid placeholder layer if a previous Raman grid created it."""
     try:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pytest
@@ -31,6 +31,7 @@ class FakeChannel:
 class FakeSequence:
     stage_positions: tuple[FakePosition, ...]
     channels: tuple[FakeChannel, ...]
+    metadata: dict = field(default_factory=dict)
 
     def replace(self, **kwargs):
         return replace(self, **kwargs)
@@ -203,6 +204,58 @@ def test_centered_grid_still_uses_current_stage_xy(grid_setup):
         (9.0, 20.0), (10.0, 20.0), (11.0, 20.0)
     ]
     assert all(position.z == 3.0 for position in sequence.stage_positions)
+
+
+def test_combine_grid_sequences_flattens_positions_and_records_boundaries():
+    channels = (FakeChannel("RM", 10.0),)
+    first = FakeSequence(
+        (FakePosition(1.0, 2.0), FakePosition(3.0, 4.0)),
+        channels,
+        metadata={"sample": "A"},
+    )
+    second = FakeSequence(
+        (FakePosition(10.0, 20.0),),
+        channels,
+    )
+
+    combined = utils.combine_grid_sequences((first, second))
+
+    assert [(position.x, position.y) for position in combined.stage_positions] == [
+        (1.0, 2.0),
+        (3.0, 4.0),
+        (10.0, 20.0),
+    ]
+    assert combined.channels == channels
+    assert combined.metadata["sample"] == "A"
+    assert combined.metadata["grid_regions"] == [
+        {
+            "grid_index": 1,
+            "p_start": 0,
+            "p_stop": 2,
+            "position_count": 2,
+        },
+        {
+            "grid_index": 2,
+            "p_start": 2,
+            "p_stop": 3,
+            "position_count": 1,
+        },
+    ]
+
+    after_removal = utils.combine_grid_sequences((second,))
+    assert after_removal.metadata["grid_regions"] == [
+        {
+            "grid_index": 1,
+            "p_start": 0,
+            "p_stop": 1,
+            "position_count": 1,
+        }
+    ]
+
+
+def test_combine_grid_sequences_requires_at_least_one_grid():
+    with pytest.raises(ValueError, match="at least one"):
+        utils.combine_grid_sequences(())
 
 
 def test_center_manual_selections_preserves_multiple_cell_layers(monkeypatch):
