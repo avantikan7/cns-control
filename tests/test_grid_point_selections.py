@@ -166,7 +166,7 @@ def grid_setup(monkeypatch):
 
 
 def run_grid(
-    grid_setup, *, preview_channel, use_placeholder=False, x_range=1.0,
+    grid_setup, *, x_range=1.0,
     corner_positions=None, x_count=None, y_count=None,
     tilt_reference_points=None,
     tilt_degree=1,
@@ -186,8 +186,6 @@ def run_grid(
         x_step=1.0,
         y_step=1.0,
         repeats=2,
-        preview_channel=preview_channel,
-        use_placeholder=use_placeholder,
         corner_positions=corner_positions,
         x_count=x_count,
         y_count=y_count,
@@ -199,9 +197,7 @@ def run_grid(
 
 
 def test_centered_grid_still_uses_current_stage_xy(grid_setup):
-    _sources, _autofocus_p, sequence = run_grid(
-        grid_setup, preview_channel=None
-    )
+    _sources, _autofocus_p, sequence = run_grid(grid_setup)
 
     assert [(p.x, p.y) for p in sequence.stage_positions] == [
         (9.0, 20.0), (10.0, 20.0), (11.0, 20.0)
@@ -209,10 +205,104 @@ def test_centered_grid_still_uses_current_stage_xy(grid_setup):
     assert all(position.z == 3.0 for position in sequence.stage_positions)
 
 
+def test_center_manual_selections_preserves_multiple_cell_layers(monkeypatch):
+    class _CategorizedSource:
+        def __init__(
+            self,
+            name,
+            data=(),
+            *,
+            role="cell",
+            display_name=None,
+            color=None,
+            source_id=None,
+        ):
+            self.name = name
+            self.role = role
+            self.display_name = display_name or name
+            self.color = color
+            self.source_id = source_id or name
+            self._points = FakePoints()
+            self._points.data = list(data)
+
+    sequence = FakeSequence(
+        (FakePosition(10.0, 20.0),),
+        (FakeChannel("BF", 10.0),),
+    )
+    core = FakeCore()
+    viewer = FakeViewer()
+    source_a = _CategorizedSource(
+        "cell:Type A",
+        [[0, 0, 0, 0, 500, 650], [0, 0, 0, 0, 520, 680]],
+        display_name="Type A",
+        color="#aa0000ff",
+        source_id="a",
+    )
+    source_b = _CategorizedSource(
+        "cell:Type B",
+        [[0, 0, 0, 0, 510, 672]],
+        display_name="Type B",
+        color="#0066ccff",
+        source_id="b",
+    )
+
+    monkeypatch.setattr(utils, "_get_seq_from_napari", lambda _window: sequence)
+    monkeypatch.setattr(
+        utils,
+        "load_vandermonde_model",
+        lambda *_args, **_kwargs: (np.zeros((1, 2)), 0),
+    )
+    monkeypatch.setattr(
+        utils,
+        "apply_vandermonde_model",
+        lambda offset_xy, *_args: tuple(offset_xy),
+    )
+
+    def _create_sources(*_args, **kwargs):
+        return [
+            _CategorizedSource(
+                name,
+                role=role,
+                display_name=display_name,
+                color=color,
+                source_id=source_id,
+            )
+            for name, role, display_name, color, source_id in zip(
+                kwargs["names"],
+                kwargs["roles"],
+                kwargs["display_names"],
+                kwargs["colors"],
+                kwargs["source_ids"],
+            )
+        ]
+
+    monkeypatch.setattr(utils, "create_point_sources", _create_sources)
+    transformer = type("_Transformer", (), {"multiplier": 1})()
+
+    new_sources, autofocus_p, new_sequence = utils.center_manual_selections(
+        core,
+        viewer,
+        object(),
+        transformer,
+        sources=[source_a, source_b],
+        vandermonde_model_path="model.json",
+        autofocus_object="None",
+        center=(512, 672),
+    )
+
+    assert [source.name for source in new_sources] == [
+        "cell:Type A",
+        "cell:Type B",
+    ]
+    assert len(new_sequence.stage_positions) == 3
+    np.testing.assert_array_equal(autofocus_p, [0, 1, 2])
+    assert [point[1] for point in new_sources[0]._points.data] == [0, 0, 1, 1]
+    assert [point[1] for point in new_sources[1]._points.data] == [2, 2]
+
+
 def test_corner_grid_normalizes_opposite_corner_directions(grid_setup):
     _sources, autofocus_p, sequence = run_grid(
         grid_setup,
-        preview_channel=None,
         corner_positions=((12.0, 21.0), (10.0, 19.0)),
     )
 
@@ -228,7 +318,6 @@ def test_corner_grid_rejects_invalid_positions(grid_setup):
     with pytest.raises(ValueError, match="two finite"):
         run_grid(
             grid_setup,
-            preview_channel=None,
             corner_positions=((1.0, 2.0), (np.nan, 4.0)),
         )
 
@@ -248,7 +337,6 @@ def test_grid_axis_uses_exact_point_count_including_endpoints():
 def test_corner_grid_uses_requested_xy_point_counts(grid_setup):
     _sources, autofocus_p, sequence = run_grid(
         grid_setup,
-        preview_channel=None,
         corner_positions=((10.0, 19.0), (12.0, 21.0)),
         x_count=2,
         y_count=5,
@@ -268,7 +356,6 @@ def test_grid_rejects_only_one_axis_count(grid_setup):
     with pytest.raises(ValueError, match="provided together"):
         run_grid(
             grid_setup,
-            preview_channel=None,
             x_count=3,
         )
 
@@ -276,7 +363,6 @@ def test_grid_rejects_only_one_axis_count(grid_setup):
 def test_x_fast_snake_reverses_alternating_y_rows(grid_setup):
     _sources, _autofocus_p, sequence = run_grid(
         grid_setup,
-        preview_channel=None,
         corner_positions=((0.0, 0.0), (2.0, 2.0)),
         x_count=3,
         y_count=3,
@@ -296,7 +382,6 @@ def test_y_fast_snake_reverses_alternating_x_columns_and_keeps_channels(
     _core, _viewer, _main_window, original_channels = grid_setup
     _sources, _autofocus_p, sequence = run_grid(
         grid_setup,
-        preview_channel=None,
         corner_positions=((0.0, 0.0), (2.0, 2.0)),
         x_count=3,
         y_count=3,
@@ -335,7 +420,6 @@ def test_grid_positions_receive_fitted_tilt_z(grid_setup):
     ]
     _sources, _autofocus_p, sequence = run_grid(
         grid_setup,
-        preview_channel=None,
         corner_positions=((0.0, 0.0), (1.0, 1.0)),
         x_count=2,
         y_count=2,
@@ -378,7 +462,6 @@ def test_degree_two_vandermonde_corrects_curved_grid_z(grid_setup):
     ]
     _sources, _autofocus_p, sequence = run_grid(
         grid_setup,
-        preview_channel=None,
         corner_positions=((-1.0, -1.0), (1.0, 1.0)),
         x_count=3,
         y_count=3,
@@ -400,30 +483,10 @@ def test_degree_two_tilt_fit_requires_six_references():
         ], degree=2)
 
 
-def test_raman_grid_without_placeholder_runs_prescan(grid_setup):
-    core, viewer, _main_window, original_channels = grid_setup
-    run_grid(grid_setup, preview_channel=None, use_placeholder=True)
-
-    sources, autofocus_p, sequence = run_grid(
-        grid_setup, preview_channel=None
-    )
-
-    assert core.run_calls == [sequence]
-    with pytest.raises(KeyError):
-        viewer.layers[utils._GRID_PLACEHOLDER_LAYER]
-    assert sequence.channels == original_channels
-    np.testing.assert_array_equal(autofocus_p, np.arange(3))
-    assert len(sources[0]._points.data) == 6
-    assert [point[1] for point in sources[0]._points.data] == [0, 0, 1, 1, 2, 2]
-    assert all(point[-2:] == [222, 111] for point in sources[0]._points.data)
-
-
-def test_raman_grid_uses_compact_sources_without_running_mda(grid_setup):
+def test_grid_uses_fixed_sources_without_running_preview_mda(grid_setup):
     core, viewer, main_window, original_channels = grid_setup
 
-    sources, autofocus_p, sequence = run_grid(
-        grid_setup, preview_channel=None, use_placeholder=True
-    )
+    sources, autofocus_p, sequence = run_grid(grid_setup)
 
     assert core.run_calls == []
     with pytest.raises(KeyError):
@@ -438,14 +501,12 @@ def test_raman_grid_uses_compact_sources_without_running_mda(grid_setup):
     assert sequence.channels == original_channels
 
 
-def test_large_compact_grid_storage_does_not_scale_with_position_count(
+def test_large_grid_storage_does_not_scale_with_position_count(
     grid_setup,
 ):
     _core, viewer, main_window, _channels = grid_setup
     sources, autofocus_p, sequence = run_grid(
         grid_setup,
-        preview_channel=None,
-        use_placeholder=True,
         corner_positions=((0.0, 0.0), (1.0, 0.0)),
         x_count=20_000,
         y_count=1,
@@ -458,31 +519,11 @@ def test_large_compact_grid_storage_does_not_scale_with_position_count(
     assert viewer.add_image_calls == 0
 
 
-def test_compact_grid_adds_one_fixed_autofocus_point(grid_setup):
+def test_grid_adds_one_fixed_autofocus_point(grid_setup):
     sources, _autofocus_p, _sequence = run_grid(
         grid_setup,
-        preview_channel=None,
-        use_placeholder=True,
         autofocus_object="laser",
     )
 
     assert [source.name for source in sources] == ["cells", "autofocus"]
     np.testing.assert_array_equal(sources[1]._base_points, [[222, 111]])
-
-
-def test_real_channel_previews_once_and_preserves_raman_channels(grid_setup):
-    core, viewer, _main_window, original_channels = grid_setup
-    run_grid(grid_setup, preview_channel=None, use_placeholder=True)
-
-    _sources, _autofocus_p, sequence = run_grid(
-        grid_setup, preview_channel="GFP"
-    )
-
-    with pytest.raises(KeyError):
-        viewer.layers[utils._GRID_PLACEHOLDER_LAYER]
-    assert len(core.run_calls) == 1
-    preview_sequence = core.run_calls[0]
-    assert len(preview_sequence.channels) == 1
-    assert preview_sequence.channels[0].config == "GFP"
-    assert preview_sequence.channels[0].exposure == 10.0
-    assert sequence.channels == original_channels

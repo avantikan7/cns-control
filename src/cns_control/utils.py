@@ -147,17 +147,6 @@ def _remove_grid_placeholder(viewer):
     viewer.layers.remove(layer)
 
 
-def _grid_preview_sequence(sequence, preview_channel):
-    """Return a one-channel preview sequence without modifying the Raman plan."""
-    if sequence.channels:
-        channel = sequence.channels[0].replace(config=preview_channel)
-    else:
-        from useq import Channel
-
-        channel = Channel(config=preview_channel)
-    return sequence.replace(channels=(channel,))
-
-
 def _get_seq_from_napari(main_window):
     """Import the napari-MDA adapter only when a sequence is requested."""
     from raman_mda_engine.utils import get_seq_from_napari
@@ -280,7 +269,10 @@ def create_point_sources(viewer,
                          ndim=6,
                          size=35,
                          names=['cells', 'autofocus'],
-                         colors=['#aa0000ff', 'springgreen']):
+                         colors=['#aa0000ff', 'springgreen'],
+                         roles=None,
+                         display_names=None,
+                         source_ids=None):
     """
     Creates and adds multiple point source layers to a Napari viewer.
 
@@ -300,6 +292,14 @@ def create_point_sources(viewer,
         Names of the point source layers (default: ['cells', 'autofocus']).
     colors : list of str, optional
         List of colors for the point sources, specified in hex format.
+    roles : list of str or None, optional
+        Explicit semantic roles such as ``"cell"`` and ``"autofocus"``.
+        When omitted, sources infer their role from their legacy names.
+    display_names : list of str or None, optional
+        User-facing names. Source ``name`` remains the stable saved
+        designation used by the Raman writer.
+    source_ids : list of str or None, optional
+        Stable IDs used in acquisition metadata.
 
     Returns:
     --------
@@ -313,7 +313,26 @@ def create_point_sources(viewer,
     from raman_mda_engine.aiming import PointsLayerSource
 
     sources = []
-    for name, color in zip(names, colors):
+    roles = [None] * len(names) if roles is None else list(roles)
+    display_names = (
+        [None] * len(names) if display_names is None else list(display_names)
+    )
+    source_ids = (
+        [None] * len(names) if source_ids is None else list(source_ids)
+    )
+    if not (
+        len(colors) == len(names)
+        and len(roles) == len(names)
+        and len(display_names) == len(names)
+        and len(source_ids) == len(names)
+    ):
+        raise ValueError(
+            "names, colors, roles, display_names, and source_ids must "
+            "have the same length"
+        )
+    for name, color, role, display_name, source_id in zip(
+        names, colors, roles, display_names, source_ids
+    ):
         points = BroadcastablePoints(
                     None,
                     #               t, c, z
@@ -325,7 +344,17 @@ def create_point_sources(viewer,
                     border_color="#5500ffff",
                 )
         viewer.add_layer(points)
-        sources.append(PointsLayerSource(points, name=name, transformer=point_transformer))
+        sources.append(
+            PointsLayerSource(
+                points,
+                name=name,
+                transformer=point_transformer,
+                role=role,
+                display_name=display_name,
+                source_id=source_id,
+                color=color,
+            )
+        )
     return sources
 
 
@@ -862,28 +891,66 @@ def center_manual_selections(core, viewer, main_window, point_transformer,
         else np.array(center)
     )
 
-    cell_data = np.asarray(sources[0]._points.data)
-    if cell_data.size == 0:
+    cell_sources = [
+        source
+        for source in sources
+        if getattr(source, "role", None) == "cell"
+        or (
+            getattr(source, "role", None) is None
+            and "cell" in source.name.lower()
+        )
+    ]
+    autofocus_sources = [
+        source
+        for source in sources
+        if getattr(source, "role", None) == "autofocus"
+        or (
+            getattr(source, "role", None) is None
+            and "autofocus" in source.name.lower()
+        )
+    ]
+    if not cell_sources:
+        raise ValueError("No cell selection layers found.")
+
+    clicked_cells = []
+    for source_index, source in enumerate(cell_sources):
+        cell_data = np.asarray(source._points.data)
+        if cell_data.size == 0:
+            continue
+        cell_data = np.atleast_2d(cell_data)
+        for row in cell_data:
+            clicked_cells.append(
+                (int(row[1]), source_index, np.asarray(row[-2:], dtype=float))
+            )
+    if not clicked_cells:
         raise ValueError("No clicked cell points found -- click points first.")
+
     af_data = None
     if not no_autofocus:
-        if len(sources) < 2 or len(np.asarray(sources[1]._points.data)) == 0:
+        if not autofocus_sources:
             raise ValueError(
                 "Autofocus is enabled but no autofocus points were clicked."
             )
-        af_data = np.asarray(sources[1]._points.data)
+        af_data = np.asarray(autofocus_sources[0]._points.data)
+        if af_data.size == 0:
+            raise ValueError(
+                "Autofocus is enabled but no autofocus points were clicked."
+            )
+        af_data = np.atleast_2d(af_data)
 
     new_positions = []
     af_points = []   # raw autofocus pixel point carried to each new position
-    for p in sorted(set(cell_data[:, 1].astype(int))):
+    new_position_source_indices = []
+    for p in sorted({record[0] for record in clicked_cells}):
         orig_pos = seq.stage_positions[p]
-        cells_yx = cell_data[cell_data[:, 1].astype(int) == p][:, -2:]
         if not no_autofocus:
             af_here = af_data[af_data[:, 1].astype(int) == p]
             if len(af_here) == 0:
                 raise ValueError(f"No autofocus point clicked at position {p}.")
             af_yx = af_here[0, -2:]
-        for cell_yx in cells_yx:
+        for _, source_index, cell_yx in (
+            record for record in clicked_cells if record[0] == p
+        ):
             offset_yx = cell_yx - img_center_yx
             offset_xy = np.array([offset_yx[1], offset_yx[0]])
             stage_dx, stage_dy = apply_vandermonde_model(offset_xy, C, degree)
@@ -893,30 +960,67 @@ def center_manual_selections(core, viewer, main_window, point_transformer,
                 x=float(orig_pos.x - stage_dx),
                 y=float(orig_pos.y - stage_dy),
             ))
+            new_position_source_indices.append(source_index)
             if not no_autofocus:
                 af_points.append(af_yx)
 
     new_seq = seq.replace(stage_positions=new_positions)
-    if no_autofocus:
-        new_sources = create_point_sources(
-            viewer, point_transformer, size=15,
-            names=['cells'], colors=['#aa0000ff'],
+    palette = (
+        "#aa0000ff",
+        "#0066ccff",
+        "#cc6600ff",
+        "#8a2be2ff",
+        "#008866ff",
+        "#cc2288ff",
+    )
+    names = [source.name for source in cell_sources]
+    colors = [
+        getattr(source, "color", None) or palette[index % len(palette)]
+        for index, source in enumerate(cell_sources)
+    ]
+    roles = ["cell"] * len(cell_sources)
+    display_names = [
+        getattr(source, "display_name", source.name)
+        for source in cell_sources
+    ]
+    source_ids = [
+        getattr(source, "source_id", None)
+        for source in cell_sources
+    ]
+    if not no_autofocus:
+        autofocus_source = autofocus_sources[0]
+        names.append(autofocus_source.name)
+        colors.append(getattr(autofocus_source, "color", None) or "springgreen")
+        roles.append("autofocus")
+        display_names.append(
+            getattr(autofocus_source, "display_name", autofocus_source.name)
         )
-    else:
-        new_sources = create_point_sources(viewer, point_transformer, size=15)
+        source_ids.append(getattr(autofocus_source, "source_id", None))
+    new_sources = create_point_sources(
+        viewer,
+        point_transformer,
+        size=15,
+        names=names,
+        colors=colors,
+        roles=roles,
+        display_names=display_names,
+        source_ids=source_ids,
+    )
+
     core.run_mda(new_seq)
     for p in range(len(new_positions)):
         if not no_autofocus:
-            new_sources[1]._points.add(
+            new_sources[len(cell_sources)]._points.add(
                 [0, p, 0, 0, af_points[p][0], af_points[p][1]]
             )
-        new_sources[0]._points.add(
+        cell_source = new_sources[new_position_source_indices[p]]
+        cell_source._points.add(
             [0, p, 0, 0, img_center_yx[0], img_center_yx[1]]
         )
         # 2 repeated points at center when the transformer doesn't multiply
         # (DAQ needs >= 2 samples per channel)
         if point_transformer.multiplier <= 1:
-            new_sources[0]._points.add(
+            cell_source._points.add(
                 [0, p, 0, 0, img_center_yx[0], img_center_yx[1]]
             )
     return new_sources, np.arange(len(new_positions)), new_seq
@@ -924,8 +1028,7 @@ def center_manual_selections(core, viewer, main_window, point_transformer,
 def grid_point_selections(core, viewer, main_window, point_transformer,
                           fov_x, fov_y,
                           x_range, y_range, x_step, y_step,
-                          repeats=2, preview_channel="BF",
-                          use_placeholder=False,
+                          repeats=2,
                           autofocus_object='None',
                           corner_positions=None,
                           x_count=None, y_count=None,
@@ -940,11 +1043,6 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
     repeats : int >= 2
         How many identical points to place at (fov_x, fov_y) per position. Must
         be >= 2 (the DAQ needs at least 2 samples per channel).
-
-    ``preview_channel`` selects the channel used to image the grid before Raman.
-    Passing ``None`` runs the sequence's normal pre-scan. If ``use_placeholder``
-    is true, that pre-scan and napari position layers are skipped; fixed points
-    are generated procedurally for each MDA event.
 
     corner_positions : ((x1, y1), (x2, y2)) or None
         Opposite stage-space corners of the grid. Coordinate order is
@@ -967,10 +1065,10 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
         the original raster order. The resulting position order is shared by
         every acquisition channel in the MDA sequence.
 
-    For normal previews, writes the grid into the napari MDA widget. Compact
-    placeholder mode bypasses that expensive editor update and returns the
-    generated sequence directly. The returned sequence always keeps its
-    original Raman acquisition channels.
+    Grid generation does not run a preview or write position layers into the
+    napari MDA editor. Fixed point sources are generated procedurally for each
+    MDA event, and the returned sequence keeps its original acquisition
+    channels.
     autofocus_object : str or None
         If a real focus target ('glass', 'quartz', 'laser', 'software',
         'cell'), an 'autofocus' layer is also created with one point per
@@ -1025,66 +1123,19 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
         grid_positions.append(template.replace(**position_values))
     new_seq = seq.replace(stage_positions=grid_positions)
 
-    compact_mode = preview_channel is None and use_placeholder
-    if compact_mode:
-        sources = _create_fixed_grid_sources(
-            core,
-            point_transformer,
-            fov_x,
-            fov_y,
-            repeats,
-            include_autofocus=not no_autofocus,
-        )
-        _remove_grid_placeholder(viewer)
-        print(
-            "[grid setup] compact grid ready "
-            f"({len(new_seq.stage_positions)} positions, no napari layers)"
-        )
-    else:
-        # Keep the editable, visible workflow for previewed grids.
-        try:
-            mda_settings = _get_mda_widget_from_napari(main_window)
-            if hasattr(mda_settings, "setValue"):
-                mda_settings.setValue(new_seq)
-                new_seq = _get_seq_from_napari(main_window)
-            else:
-                print(
-                    "[grid setup] MDA widget has no setValue -- "
-                    "grid may not show"
-                )
-        except Exception as e:
-            print(f"[grid setup] couldn't write positions to MDA widget: {e}")
-
-        if no_autofocus:
-            sources = create_point_sources(
-                viewer, point_transformer, size=15,
-                names=['cells'], colors=['#aa0000ff'],
-            )
-        else:
-            sources = create_point_sources(
-                viewer, point_transformer, size=15
-            )
-
-        _remove_grid_placeholder(viewer)
-        if preview_channel is None:
-            core.run_mda(new_seq)
-            print("[grid setup] grid ready after Raman pre-scan")
-        else:
-            preview_seq = _grid_preview_sequence(new_seq, preview_channel)
-            core.run_mda(preview_seq)
-            print(f"[grid setup] grid ready after {preview_channel} preview")
-
-        # Row order (.., y, x) matches the other selection functions.
-        for p in range(len(new_seq.stage_positions)):
-            for _ in range(repeats):
-                sources[0]._points.add([0, p, 0, 0, fov_y, fov_x])
-        if not no_autofocus:
-            n_pos = len(new_seq.stage_positions)
-            af_pts = np.array(
-                [[0, p, 0, 0, fov_y, fov_x] for p in range(n_pos)],
-                dtype=float,
-            )
-            sources[1]._points.add(af_pts)
+    sources = _create_fixed_grid_sources(
+        core,
+        point_transformer,
+        fov_x,
+        fov_y,
+        repeats,
+        include_autofocus=not no_autofocus,
+    )
+    _remove_grid_placeholder(viewer)
+    print(
+        "[grid setup] grid ready "
+        f"({len(new_seq.stage_positions)} positions, no preview or napari layers)"
+    )
 
     # A range keeps membership checks O(1) without allocating another
     # position-sized numpy array.
