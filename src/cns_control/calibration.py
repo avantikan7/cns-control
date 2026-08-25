@@ -388,12 +388,6 @@ class ManualImageSelector:
             else:
                 print("Finished selection.")
                 plt.close()
-            if self.current_idx < self.num_images - 1:
-                self.current_idx += 1
-                self.show_image()
-            else:
-                print("Finished selection.")
-                plt.close()
 
     def start(self):
         plt.show()
