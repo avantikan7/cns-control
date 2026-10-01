@@ -173,6 +173,7 @@ def run_grid(
     tilt_degree=1,
     snake_axis=None,
     autofocus_object="None",
+    base_z=None,
 ):
     core, viewer, main_window, _channels = grid_setup
     return utils.grid_point_selections(
@@ -194,6 +195,7 @@ def run_grid(
         tilt_degree=tilt_degree,
         snake_axis=snake_axis,
         autofocus_object=autofocus_object,
+        base_z=base_z,
     )
 
 
@@ -204,6 +206,27 @@ def test_centered_grid_still_uses_current_stage_xy(grid_setup):
         (9.0, 20.0), (10.0, 20.0), (11.0, 20.0)
     ]
     assert all(position.z == 3.0 for position in sequence.stage_positions)
+
+
+def test_explicit_grid_z_is_saved_for_every_position(grid_setup):
+    _sources, _autofocus_p, sequence = run_grid(grid_setup, base_z=-12.3456)
+    assert all(position.z == -12.3456 for position in sequence.stage_positions)
+
+
+def test_tilt_surface_overrides_constant_grid_z(grid_setup):
+    references = [(0, 0, 10), (1, 0, 11), (0, 1, 12)]
+    _sources, _autofocus_p, sequence = run_grid(
+        grid_setup, base_z=100, tilt_reference_points=references,
+    )
+    assert [p.z for p in sequence.stage_positions] == pytest.approx(
+        [10 + p.x + 2 * p.y for p in sequence.stage_positions]
+    )
+
+
+@pytest.mark.parametrize("base_z", [float("nan"), float("inf"), -float("inf")])
+def test_grid_rejects_nonfinite_z(grid_setup, base_z):
+    with pytest.raises(ValueError, match="Grid Z must be finite"):
+        run_grid(grid_setup, base_z=base_z)
 
 
 def test_combine_grid_sequences_flattens_positions_and_records_boundaries():

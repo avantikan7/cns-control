@@ -1068,7 +1068,7 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
                           x_count=None, y_count=None,
                           tilt_reference_points=None,
                           tilt_degree=1,
-                          snake_axis=None):
+                          snake_axis=None, base_z=None):
     """
     Build a grid of stage positions, each carrying `repeats` copies of the
     SAME single fixed point (fov_x, fov_y). By default the grid is centered on
@@ -1093,6 +1093,9 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
     tilt_degree : int
         Total degree of the centered/scaled 2D Vandermonde Z surface (1--3).
         The required reference count is (degree + 1)(degree + 2)/2.
+    base_z : float or None
+        Explicit constant grid Z in micrometers. None preserves the template
+        Z. A fitted tilt surface takes precedence over this value.
     snake_axis : {'x', 'y'} or None
         Fast axis for snake traversal. X reverses direction on alternating Y
         rows; Y reverses direction on alternating X columns. None preserves
@@ -1145,6 +1148,11 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
             f"RMSE={rmse:.6f} um"
         )
     template = seq.stage_positions[0]
+    if base_z is not None:
+        base_z = float(base_z)
+        if not np.isfinite(base_z):
+            raise ValueError("Grid Z must be finite")
+        template = template.replace(z=base_z)
     grid_positions = []
     for gx, gy in _ordered_grid_coordinates(xs, ys, snake_axis):
         position_values = {"x": float(gx), "y": float(gy)}
