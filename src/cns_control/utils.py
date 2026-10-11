@@ -1219,7 +1219,22 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
     # A range keeps membership checks O(1) without allocating another
     # position-sized numpy array.
     return sources, range(len(xs) * len(ys)), new_seq
+def stop_live_acquisitions(core):
+    """Stop every loaded camera while live-view event handlers are connected."""
+    from pymmcore_plus import DeviceType
+
+    errors = []
+    for camera in core.getLoadedDevicesOfType(DeviceType.CameraDevice):
+        try:
+            core.stopSequenceAcquisition(camera)
+        except Exception as error:
+            errors.append(f"{camera}: {error}")
+    if errors:
+        raise RuntimeError("Could not stop live acquisitions: " + "; ".join(errors))
+
+
 def unload(core, N=20):
+    stop_live_acquisitions(core)
     n = 0.1  # starting sleep time
     for attempt in range(N):
         if attempt == N-1:
