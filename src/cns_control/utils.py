@@ -148,6 +148,16 @@ def combine_grid_sequences(sequences):
     sequences = tuple(sequences)
     if not sequences:
         raise ValueError("at least one grid sequence is required")
+    if all("raman_grid" in sequence.metadata for sequence in sequences):
+        metadata = dict(sequences[0].metadata)
+        metadata["raman_grid"] = {
+            "version": 1,
+            "regions": [region for sequence in sequences
+                        for region in sequence.metadata["raman_grid"]["regions"]],
+        }
+        return sequences[0].replace(stage_positions=(), metadata=metadata)
+    if any("raman_grid" in sequence.metadata for sequence in sequences):
+        raise ValueError("All grid regions must use the same dense grid mode")
 
     positions = []
     regions = []
@@ -181,11 +191,21 @@ def _remove_grid_placeholder(viewer):
     viewer.layers.remove(layer)
 
 
-def _get_seq_from_napari(main_window):
+def _get_seq_from_napari(main_window, *, survey=True):
     """Import the napari-MDA adapter only when a sequence is requested."""
     from raman_mda_engine.utils import get_seq_from_napari
 
-    return get_seq_from_napari(main_window)
+    from useq import TIntervalLoops, ZRelativePositions
+    sequence = get_seq_from_napari(main_window)
+    if not survey:
+        return sequence
+    metadata = dict(sequence.metadata)
+    metadata.pop("raman", None)
+    metadata.pop("confocal_control", None)
+    return sequence.replace(time_plan=TIntervalLoops(loops=1, interval=0),
+                            z_plan=ZRelativePositions(relative=[0]), autofocus_plan=None,
+                            channels=[channel for channel in sequence.channels if channel.config != "RM"],
+                            metadata=metadata)
 
 
 def _get_mda_widget_from_napari(main_window):
@@ -477,7 +497,7 @@ def set_up_new_seq(main_window, point_transformer, engine, seq=None, total_expos
         raise ValueError('Minimal exposure time per Raman collection is 0.0738s')
 
     if seq is None:
-        seq = _get_seq_from_napari(main_window)
+        seq = _get_seq_from_napari(main_window, survey=False)
     new_meta = dict(seq.metadata)
     num_z = seq.z_plan.num_positions()
     # add in raman metadata to do raman
@@ -1062,21 +1082,23 @@ def center_manual_selections(core, viewer, main_window, point_transformer,
 def grid_point_selections(core, viewer, main_window, point_transformer,
                           fov_x, fov_y,
                           x_range, y_range, x_step, y_step,
-                          repeats=2,
+                          repeats=1,
                           autofocus_object='None',
                           corner_positions=None,
                           x_count=None, y_count=None,
                           tilt_reference_points=None,
                           tilt_degree=1,
-                          snake_axis=None, base_z=None):
+                          snake_axis=None, base_z=None, compact=False,
+                          include_autofocus_anchor=False):
     """
     Build a grid of stage positions, each carrying `repeats` copies of the
     SAME single fixed point (fov_x, fov_y). By default the grid is centered on
     the current stage XY. Pass two corner positions to define explicit bounds.
 
-    repeats : int >= 2
-        How many identical points to place at (fov_x, fov_y) per position. Must
-        be >= 2 (the DAQ needs at least 2 samples per channel).
+    repeats : int >= 1
+        Legacy point-duplication option. The UI always prepares one point;
+        MDA's frames-per-point setting controls repeated spectral collections.
+        Single-point DAQ output is handled internally.
 
     corner_positions : ((x1, y1), (x2, y2)) or None
         Opposite stage-space corners of the grid. Coordinate order is
@@ -1111,10 +1133,13 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
         'cell'), an 'autofocus' layer is also created with one point per
         position at the same fixed (fov_y, fov_x). If None/"None", only the
         'cells' layer is created (original behavior).
+    include_autofocus_anchor : bool
+        Prepare a fixed reference point independent of the autofocus mode.
+        The shared MDA panel chooses whether and how to use this reference.
     """
     repeats = int(repeats)
-    if repeats < 2:
-        raise ValueError("repeats must be an integer >= 2")
+    if repeats < 1:
+        raise ValueError("repeats must be an integer >= 1")
 
     no_autofocus = _is_no_autofocus(autofocus_object)
     seq = _get_seq_from_napari(main_window)
@@ -1147,23 +1172,35 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
             f"origin=({origin[0]:.4f}, {origin[1]:.4f}), "
             f"RMSE={rmse:.6f} um"
         )
-    template = seq.stage_positions[0]
+    from useq import Position
+    template = seq.stage_positions[0] if seq.stage_positions else Position(z=core.getZPosition())
     if base_z is not None:
         base_z = float(base_z)
         if not np.isfinite(base_z):
             raise ValueError("Grid Z must be finite")
         template = template.replace(z=base_z)
-    grid_positions = []
-    for gx, gy in _ordered_grid_coordinates(xs, ys, snake_axis):
-        position_values = {"x": float(gx), "y": float(gy)}
-        if tilt_model is not None:
-            position_values["z"] = float(
-                _evaluate_tilt_surface(
-                    np.array([gx, gy]), tilt_model, tilt_degree
-                )[0]
-            )
-        grid_positions.append(template.replace(**position_values))
-    new_seq = seq.replace(stage_positions=grid_positions)
+    if compact:
+        if snake_axis not in (None, "x", "y"):
+            raise ValueError("snake_axis must be None, 'x', or 'y'")
+        surface = None if tilt_model is None else {
+            "origin": tilt_model[0].tolist(), "scale": tilt_model[1].tolist(),
+            "coefficients": tilt_model[2].tolist(), "degree": int(tilt_degree),
+        }
+        region = {"x": [float(xs[0]), float(xs[-1]), len(xs)],
+                  "y": [float(ys[0]), float(ys[-1]), len(ys)],
+                  "z": template.z, "tilt": surface, "snake_axis": snake_axis}
+        new_seq = seq.replace(stage_positions=(), grid_plan=None,
+                              metadata={**seq.metadata, "raman_grid": {"version": 1, "regions": [region]}})
+    else:
+        grid_positions = []
+        for gx, gy in _ordered_grid_coordinates(xs, ys, snake_axis):
+            position_values = {"x": float(gx), "y": float(gy)}
+            if tilt_model is not None:
+                position_values["z"] = float(
+                    _evaluate_tilt_surface(np.array([gx, gy]), tilt_model, tilt_degree)[0]
+                )
+            grid_positions.append(template.replace(**position_values))
+        new_seq = seq.replace(stage_positions=grid_positions)
 
     sources = _create_fixed_grid_sources(
         core,
@@ -1171,17 +1208,17 @@ def grid_point_selections(core, viewer, main_window, point_transformer,
         fov_x,
         fov_y,
         repeats,
-        include_autofocus=not no_autofocus,
+        include_autofocus=include_autofocus_anchor or not no_autofocus,
     )
     _remove_grid_placeholder(viewer)
     print(
         "[grid setup] grid ready "
-        f"({len(new_seq.stage_positions)} positions, no preview or napari layers)"
+        f"({len(xs) * len(ys)} positions, no preview or napari layers)"
     )
 
     # A range keeps membership checks O(1) without allocating another
     # position-sized numpy array.
-    return sources, range(len(new_seq.stage_positions)), new_seq
+    return sources, range(len(xs) * len(ys)), new_seq
 def unload(core, N=20):
     n = 0.1  # starting sleep time
     for attempt in range(N):

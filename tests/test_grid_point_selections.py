@@ -187,7 +187,6 @@ def run_grid(
         y_range=0.0,
         x_step=1.0,
         y_step=1.0,
-        repeats=2,
         corner_positions=corner_positions,
         x_count=x_count,
         y_count=y_count,
@@ -571,7 +570,7 @@ def test_grid_uses_fixed_sources_without_running_preview_mda(grid_setup):
     assert main_window.settings.set_value_calls == 0
     assert len(sources) == 1
     np.testing.assert_array_equal(
-        sources[0]._base_points, [[222, 111], [222, 111]]
+        sources[0]._base_points, [[222, 111]]
     )
     np.testing.assert_array_equal(autofocus_p, np.arange(3))
     assert sequence.channels == original_channels
@@ -590,7 +589,7 @@ def test_large_grid_storage_does_not_scale_with_position_count(
 
     assert len(sequence.stage_positions) == 20_000
     assert len(autofocus_p) == 20_000
-    assert sources[0]._base_points.shape == (2, 2)
+    assert sources[0]._base_points.shape == (1, 2)
     assert main_window.settings.set_value_calls == 0
     assert viewer.add_image_calls == 0
 
@@ -603,3 +602,38 @@ def test_grid_adds_one_fixed_autofocus_point(grid_setup):
 
     assert [source.name for source in sources] == ["cells", "autofocus"]
     np.testing.assert_array_equal(sources[1]._base_points, [[222, 111]])
+
+
+def test_dense_grid_generation_keeps_million_positions_procedural(grid_setup, monkeypatch):
+    from useq import MDASequence, Position
+    from raman_mda_engine.grid_plan import grid_count, grid_position
+    core, viewer, main_window, _channels = grid_setup
+    monkeypatch.setattr(utils, "_get_seq_from_napari", lambda _window:
+                        MDASequence(stage_positions=[Position(x=10, y=20, z=3)], channels=["BF"]))
+    sources, autofocus_p, sequence = utils.grid_point_selections(
+        core, viewer, main_window, object(), fov_x=111, fov_y=222,
+        x_range=100, y_range=100, x_step=1, y_step=1,
+        x_count=1000, y_count=1000, compact=True, snake_axis="x",
+    )
+    assert grid_count(sequence) == 1_000_000
+    assert sequence.stage_positions == ()
+    assert len(sequence.model_dump_json()) < 2000
+    assert len(autofocus_p) == 1_000_000
+    assert len(sources[0]._base_points) == 1
+    assert grid_position(sequence, 0).x == -90
+    assert main_window.settings.set_value_calls == 0
+    assert core.run_calls == []
+    combined = utils.combine_grid_sequences([sequence, sequence])
+    assert grid_count(combined) == 2_000_000
+    assert combined.stage_positions == ()
+
+
+def test_grid_prepares_focus_anchor_independent_of_autofocus_mode(grid_setup):
+    core, viewer, main_window, _channels = grid_setup
+    sources, _positions, _sequence = utils.grid_point_selections(
+        core, viewer, main_window, object(), fov_x=111, fov_y=222,
+        x_range=1, y_range=0, x_step=1, y_step=1,
+        autofocus_object="None", include_autofocus_anchor=True)
+    assert [source.name for source in sources] == ["cells", "autofocus"]
+    np.testing.assert_array_equal(sources[1]._base_points, [[222, 111]])
+    assert core.run_calls == []
